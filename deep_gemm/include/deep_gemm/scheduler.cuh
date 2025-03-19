@@ -16,6 +16,8 @@ template <GemmType kGemmType,
           uint32_t kNumNBlocks = cell_div(SHAPE_N, BLOCK_N),
           uint32_t kNumNBlocksPerGroup = 16>
 struct Scheduler {
+    // NOTE: 一个threadBlock会处理多个block
+    // 从GemmType::Normal开始看
     int current_iter = -1;
     uint32_t num_aligned_m_blocks;
 
@@ -30,6 +32,7 @@ struct Scheduler {
 
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
                                                   int* grouped_layout = nullptr) {
+        // NOTE: BLOCK_M分块, 可以分几块, k-iter + (M, K)
         num_aligned_m_blocks = cell_div(shape_m, BLOCK_M);
         if constexpr (kGemmType == GemmType::Normal) {
             num_blocks = num_aligned_m_blocks * kNumNBlocks;
@@ -44,6 +47,8 @@ struct Scheduler {
 
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
+        // NOTE: 一次load多个block, 后续计算复用该load
+        // 找组id, 找组内id
 
         // Swizzle for better L2 usages
         auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
@@ -59,8 +64,10 @@ struct Scheduler {
     __device__ __forceinline__ uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
                                                        const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
         if constexpr (kGemmType == GemmType::Normal) {
+            // NOTE: 计算偏移
             return block_idx * block_size;
         } else if (kGemmType == GemmType::GroupedContiguous) {
+            // NOTE: 查表
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(grouped_layout + m_block_idx * BLOCK_M);
             return offset * shape_dim + block_idx * block_size;
         } else if (kGemmType == GemmType::GroupedMasked) {
@@ -68,6 +75,7 @@ struct Scheduler {
         }
     }
 
+    // NOTE: 获取m_block_idx, n_block_idx
     __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
         const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
 

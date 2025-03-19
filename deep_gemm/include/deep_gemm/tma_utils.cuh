@@ -81,6 +81,7 @@ CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2],
     return tensor_map;
 }
 
+// NOTE: tma拷贝
 template <uint32_t kNumTMAMulticast = 1>
 __device__ __forceinline__ void
 tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,

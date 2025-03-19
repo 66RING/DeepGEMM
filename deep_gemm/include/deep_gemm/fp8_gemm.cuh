@@ -86,10 +86,18 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     float* smem_scales_b;
 
     // TMA Barrier for both divisible and non-divisible cases
+    // NOTE: full_barriers: tma_copy正在执行的信号, empty_barriers: tma_copy完成的信号
+    // data_warp:
+    //  empty_barriers->wait()
+    //  tma_copy(full_barriers)
+    // math_warp:
+    //  full_barriers->wait()
+    //  empty_barriers->arrive()
     Barrier* full_barriers[kNumStages];
     Barrier* empty_barriers[kNumStages];
 
     // Fill shared memory pointers
+    // NOTE:分配各个stage需要的指针
     #pragma unroll
     for (int i = 0; i < kNumStages; ++ i) {
         smem_a[i] = reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE);
@@ -99,6 +107,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     smem_scales_b = reinterpret_cast<float*>(smem_buffer + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE));
 
     // Fill barriers
+    // NOTE:分配和初始化barrier
     DG_STATIC_ASSERT(sizeof(Barrier) % sizeof(float) == 0, "Misaligned barriers");
     DG_STATIC_ASSERT(not kMustUseUniformedScaleB or SHAPE_K_SCALES % (sizeof(Barrier) / sizeof(float)) == 0, "Misaligned barriers");
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_scales_b + SHAPE_K_SCALES * (kMustUseUniformedScaleB ? 1 : 2));
@@ -128,6 +137,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     // For pipeline unrolling
     struct DivisibleK {};
     struct NotDivisibleK {};
+    // NOTE: k-iter: copy / mma
     auto launch_k_iterations = [](const auto& func) {
         if constexpr (SHAPE_K % kFullKOfAllStages == 0) {
             for (int k_iter = 0; k_iter < kNumIterations; ++ k_iter)
@@ -135,6 +145,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         } else {
             for (int k_iter = 0; k_iter < kNumIterations - 1; ++ k_iter)
                 func(k_iter, DivisibleK{});
+            // NOTE: 不能被stage整除, 单独执行并标记NotDivisibleK
             func(kNumIterations - 1, NotDivisibleK{});
         }
     };
@@ -147,25 +158,34 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = Scheduler<kGemmType, SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast>(shape_m, grouped_layout);
 
+    // NOTE: threadIdx.x >= kNumMathThreads部分是data warp, 其他是math warp
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
+        // NOTE: data warp或者说是tma warp-group, 或者说是copy warp
 
         // NOTES: only one thread (or warp) will be used
+        // NOTE: 让一个thread发起tma copy
+        // TODO: 其他的thread (threadIdx.x >= kNumMathThreads)呢?
         if (threadIdx.x == kNumMathThreads) {
             // Persistently schedule over blocks
+            // NOTE: iter block
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 launch_k_iterations([&](int k_iter, auto type) {
                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                    // NOTE: 如果不能stage整除则计算需要的stage数
                     constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
+                    // NOTE: 流水
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // Wait consumer release
+                        // NOTE: 等待消费者
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
                         // Issue TMA A with broadcasting
+                        // NOTE: 发起tma copy, 拷贝A
                         auto& full_barrier = *full_barriers[s];
                         int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
                         tma_copy<kNumTMAMulticast>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
@@ -175,12 +195,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                                                    scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
 
                         // Issue TMA B without broadcasting
+                        // NOTE: 发起tma copy, 拷贝B
                         tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                  smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        // NOTE: 期望发送了那么多数据
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
                     // Wait unaligned cases
+                    // NOTE: 没整除的情况, 等待单独那次完成
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
@@ -201,6 +224,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
+        // NOTE: cool, 很细节
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
 
@@ -217,6 +241,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+            // NOTE:只让warp0后的warp做B scale的gmem -> smem
             if (threadIdx.x >= 32) {
                 auto num_previous_lines = scheduler.get_global_idx<false>(cell_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
                 auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
@@ -227,9 +252,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
+            // NOTE: 一个接wgmma输出, 一个接scale后的输出
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
 
             // Empty barrier arrival
+            // NOTE: empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
+            // barrier一个warp一个, 只让第一个thread(lane0)做arrive
             auto empty_barrier_arrive = [&](int s) {
                 if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
@@ -239,6 +267,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             };
 
             // Launch MMAs
+            // NOTE: WGMMA
             launch_k_iterations([&](int k_iter, auto type) {
                 constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
                 constexpr int kNumInnerStages = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
@@ -253,6 +282,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         scale_b_1 = ld_shared(smem_scales_b + k_iter * kNumStages + s + SHAPE_K_SCALES);
 
                     // Wait TMA arrivals
+                    // NOTE: 等待tma_copy完成
                     full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 
                     // Read A scales
@@ -262,8 +292,10 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     // Commit WGMMA instructions
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
+                        // NOTE: 累加器fency, 防止指令重排, 保证后续看见(mma)
                         warpgroup_fence_operand(accum[i]);
                     warpgroup_arrive();
+                    // NOTE: 执行wgmma
                     #pragma unroll
                     for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
                         auto desc_a = make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
@@ -274,9 +306,11 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
                         warpgroup_fence_operand(accum[i]);
+                    // NOTE: 等待完成
                     warpgroup_wait<0>();
 
                     // Notify barrier arrival
+                    // NOTE: 通知开启下一次搬运, smem可以覆盖
                     empty_barrier_arrive(s);
 
                     // Promote with scales
@@ -284,6 +318,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     float scale_0_1, scale_1_1;
                     if constexpr (not kMustUseUniformedScaleB)
                         scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                    // NOTE: scale
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                         bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
@@ -303,6 +338,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             });
 
             // Write back to shared memory using STSM
+            // NOTE: 写回reg -> smem -> gmem
+            // stmatrix
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
             for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {

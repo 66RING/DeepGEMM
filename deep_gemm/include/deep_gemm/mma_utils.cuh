@@ -6,6 +6,7 @@
 
 namespace deep_gemm {
 
+// NOTE: SS可能表示两个矩阵的位置: A矩阵和B矩阵
 struct SM90_64x16x32_F32E4M3E4M3_SS {
     __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b,
                                  float& d00, float& d01, float& d02, float& d03, float& d04, float& d05, float& d06, float& d07,
